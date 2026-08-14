@@ -17,6 +17,7 @@ ou dans la variable d'environnement DISCORD_BOT_TOKEN.
 
 import asyncio
 import fcntl
+import re
 import os
 import sqlite3
 import sys
@@ -108,7 +109,51 @@ db.execute(
     """CREATE TABLE IF NOT EXISTS guides(
   channel_id INTEGER PRIMARY KEY, message_id INTEGER, updated INTEGER)"""
 )
+# Salons retenus par IDENTIFIANT, pas par nom : un identifiant survit aux
+# renommages, un nom non. Sans ça, ajouter un emoji au nom d'un salon fait que
+# `/setup` ne le reconnaît plus et en recrée un doublon à côté.
+db.execute(
+    """CREATE TABLE IF NOT EXISTS channels(
+  guild_id INTEGER, key TEXT, channel_id INTEGER,
+  PRIMARY KEY(guild_id, key))"""
+)
 db.commit()
+
+
+def _norm(name: str) -> str:
+    """Nom comparable : emojis, majuscules et ponctuation retirés."""
+    return re.sub(r"[^a-z0-9]+", "-", (name or "").lower()).strip("-")
+
+
+async def ensure_channel(guild, cat, key, display, topic, overwrites):
+    """Retrouve un salon par ID mémorisé, puis par nom normalisé, sinon le crée.
+
+    Trois niveaux de repli, du plus robuste au plus fragile, pour que l'on
+    puisse renommer les salons librement sans que `/setup` fasse des doublons.
+    """
+    row = db.execute(
+        "SELECT channel_id FROM channels WHERE guild_id=? AND key=?", (guild.id, key)
+    ).fetchone()
+    if row:
+        ch = guild.get_channel(row[0])
+        if ch is not None:
+            return ch, False
+
+    target = _norm(key)
+    for ch in cat.text_channels:
+        if _norm(ch.name) == target:
+            db.execute(
+                "INSERT OR REPLACE INTO channels VALUES(?,?,?)", (guild.id, key, ch.id)
+            )
+            db.commit()
+            return ch, False
+
+    ch = await guild.create_text_channel(
+        display, category=cat, topic=topic, overwrites=overwrites
+    )
+    db.execute("INSERT OR REPLACE INTO channels VALUES(?,?,?)", (guild.id, key, ch.id))
+    db.commit()
+    return ch, True
 
 
 def meta_get(k, default=None):
@@ -693,11 +738,18 @@ async def setup_cmd(ctx):
     # Noms préfixés : ce bot cohabite avec le bot overlap, dont le `/setup` crée
     # déjà « how-it-works » et « discussion ». Des noms génériques feraient que
     # chaque bot croit reconnaître les salons de l'autre.
+    # (clé logique, nom affiché à la création, sujet, lecture seule)
+    # La clé ne change jamais : c'est elle qui identifie le salon en base. Le nom
+    # affiché est libre — tu peux le renommer sans rien casser.
     plan = [
-        ("coherence-guide", "Read this first — what an arbitrage alert here means", True),
-        ("coherence-board", "Live state of the market, rewritten automatically", True),
-        ("arb-alerts", "Executable inconsistencies, the moment they appear", True),
-        ("arb-discussion", "Talk about the calls here — open to everyone", False),
+        ("coherence-guide", "📖coherence-guide",
+         "Read this first — what an arbitrage alert here means", True),
+        ("coherence-board", "🧭coherence-board",
+         "Live state of the market, rewritten automatically", True),
+        ("arb-alerts", "🚨arb-alerts",
+         "Executable inconsistencies, the moment they appear", True),
+        ("arb-discussion", "💬arb-discussion",
+         "Talk about the calls here — open to everyone", False),
     ]
 
     cat = discord.utils.get(g.categories, name="POLYMARKET COHERENCE")
@@ -705,32 +757,25 @@ async def setup_cmd(ctx):
         cat = await g.create_category("POLYMARKET COHERENCE")
 
     made, reused, chans = [], [], {}
-    for name, topic, locked in plan:
-        # Chercher UNIQUEMENT dans notre catégorie, jamais dans tout le serveur :
-        # une recherche globale retrouverait les salons d'un autre bot et
-        # écrirait dedans en les laissant dans sa catégorie à lui.
-        ch = discord.utils.get(cat.text_channels, name=name)
-        if ch is None:
-            try:
-                ch = await g.create_text_channel(
-                    name,
-                    category=cat,
-                    topic=topic,
-                    # py-cord exige un dict : `None` lève InvalidArgument et fait
-                    # échouer toute la commande sur le premier salon ouvert.
-                    overwrites=read_only if locked else {},
-                )
-            except discord.HTTPException as e:
-                return await ctx.respond(
-                    f"Could not create **#{name}**: {e}\n"
-                    "Channels created before this point were kept — fix the issue "
-                    "and run `/setup` again, it reuses what already exists.",
-                    ephemeral=True,
-                )
-            made.append(ch)
-        else:
-            reused.append(ch)
-        chans[name] = ch
+    for key, display, topic, locked in plan:
+        # Recherche confinée à NOTRE catégorie, jamais tout le serveur : une
+        # recherche globale retrouverait les salons d'un autre bot Polymarket.
+        try:
+            ch, created = await ensure_channel(
+                g, cat, key, display, topic,
+                # py-cord exige un dict : `None` lève InvalidArgument et fait
+                # échouer toute la commande sur le premier salon ouvert.
+                read_only if locked else {},
+            )
+        except discord.HTTPException as e:
+            return await ctx.respond(
+                f"Could not create **{display}**: {e}\n"
+                "Channels created before this point were kept — fix the issue "
+                "and run `/setup` again, it reuses what already exists.",
+                ephemeral=True,
+            )
+        (made if created else reused).append(ch)
+        chans[key] = ch
 
     await upsert_pinned(chans["coherence-guide"], "guides", build_guide_embed())
 
