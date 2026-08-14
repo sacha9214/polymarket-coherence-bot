@@ -123,10 +123,16 @@ zéro, ce qui prouve que le pipeline travaille et permet de régler les seuils.
 | `/guide` | Poste la note « comment lire ce salon » (à épingler) |
 
 `/setup` crée la catégorie **POLYMARKET COHERENCE** avec quatre salons —
-`how-it-works` (guide épinglé), `coherence-board` (tableau vivant), `arb-alerts`
-(le flux) et `discussion` (ouvert) — les trois premiers en lecture seule pour les
-membres. Relancer la commande réutilise les salons existants au lieu d'en créer
-des doublons.
+`coherence-guide` (guide épinglé), `coherence-board` (tableau vivant),
+`arb-alerts` (le flux) et `arb-discussion` (ouvert) — les trois premiers en
+lecture seule pour les membres. La commande est **idempotente** : la relancer
+réutilise les salons existants et recâble tout, elle ne crée pas de doublons.
+
+Les noms sont préfixés à dessein. Ce bot cohabite avec le bot overlap, dont le
+`/setup` crée déjà `how-it-works` et `discussion` : avec des noms génériques,
+chaque bot croirait reconnaître les salons de l'autre et irait écrire dedans. La
+recherche de salons existants est en plus limitée à notre propre catégorie, pas
+au serveur entier.
 
 ### Le tableau vivant
 
