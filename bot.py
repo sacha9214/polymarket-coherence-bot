@@ -558,6 +558,58 @@ async def board_cmd(ctx):
 
 
 @bot.slash_command(
+    name="preview",
+    description="Post a sample alert here to check formatting and permissions",
+    guild_ids=GUILDS,
+)
+async def preview_cmd(ctx):
+    await ctx.defer(ephemeral=True)
+
+    # Chiffres inventés, mais réalistes : c'est la seule façon de vérifier le rendu
+    # et les permissions d'écriture tant que le marché reste cohérent.
+    sample = C.Opportunity(
+        kind="ladder_strikes",
+        title="Ethereum above ___ on August 20?  (SAMPLE)",
+        slug="",
+        detail=(
+            "« 1,900 » implique « 1,800 », or le premier s'achète moins cher : "
+            "bid 0.845 > ask 0.830. Monotonie violée."
+        ),
+        legs=["YES 1,800 @ 0.830", "NO 1,900 @ 0.155"],
+        units=1200,
+        capital=1182.0,
+        profit=18.0,
+        days=6.5,
+    )
+
+    e = opp_embed(sample)
+    # Marquage très visible : une alerte fabriquée qui traîne dans un salon
+    # d'alertes doit être impossible à confondre avec une vraie.
+    e.title = "🧪 EXAMPLE ALERT — not a real opportunity"
+    e.url = None
+    e.color = 0x95A5A6
+    e.set_footer(
+        text="Sample posted by /preview to test formatting and permissions. "
+        "These numbers are made up — do not trade this."
+    )
+
+    try:
+        await ctx.channel.send(embed=e)
+    except discord.Forbidden:
+        return await ctx.respond(
+            "I can't post in this channel. Give my role **Send Messages** and "
+            "**Embed Links** here, then run `/preview` again.",
+            ephemeral=True,
+        )
+
+    await ctx.respond(
+        "🧪 Sample alert posted — this is exactly how a real one will look.\n"
+        "Delete it whenever you like; it is not stored and never repeats.",
+        ephemeral=True,
+    )
+
+
+@bot.slash_command(
     name="setup",
     description="Create the full channel structure and wire everything up",
     guild_ids=GUILDS,
@@ -587,11 +639,14 @@ async def setup_cmd(ctx):
         g.me: discord.PermissionOverwrite(send_messages=True, manage_messages=True),
     }
 
+    # Noms préfixés : ce bot cohabite avec le bot overlap, dont le `/setup` crée
+    # déjà « how-it-works » et « discussion ». Des noms génériques feraient que
+    # chaque bot croit reconnaître les salons de l'autre.
     plan = [
-        ("how-it-works", "Read this first — what an arbitrage alert here means", True),
+        ("coherence-guide", "Read this first — what an arbitrage alert here means", True),
         ("coherence-board", "Live state of the market, rewritten automatically", True),
         ("arb-alerts", "Executable inconsistencies, the moment they appear", True),
-        ("discussion", "Talk about the calls here — open to everyone", False),
+        ("arb-discussion", "Talk about the calls here — open to everyone", False),
     ]
 
     cat = discord.utils.get(g.categories, name="POLYMARKET COHERENCE")
@@ -600,18 +655,33 @@ async def setup_cmd(ctx):
 
     made, reused, chans = [], [], {}
     for name, topic, locked in plan:
-        ch = discord.utils.get(g.text_channels, name=name)
+        # Chercher UNIQUEMENT dans notre catégorie, jamais dans tout le serveur :
+        # une recherche globale retrouverait les salons d'un autre bot et
+        # écrirait dedans en les laissant dans sa catégorie à lui.
+        ch = discord.utils.get(cat.text_channels, name=name)
         if ch is None:
-            ch = await g.create_text_channel(
-                name, category=cat, topic=topic,
-                overwrites=read_only if locked else None,
-            )
+            try:
+                ch = await g.create_text_channel(
+                    name,
+                    category=cat,
+                    topic=topic,
+                    # py-cord exige un dict : `None` lève InvalidArgument et fait
+                    # échouer toute la commande sur le premier salon ouvert.
+                    overwrites=read_only if locked else {},
+                )
+            except discord.HTTPException as e:
+                return await ctx.respond(
+                    f"Could not create **#{name}**: {e}\n"
+                    "Channels created before this point were kept — fix the issue "
+                    "and run `/setup` again, it reuses what already exists.",
+                    ephemeral=True,
+                )
             made.append(ch)
         else:
             reused.append(ch)
         chans[name] = ch
 
-    await upsert_pinned(chans["how-it-works"], "guides", build_guide_embed())
+    await upsert_pinned(chans["coherence-guide"], "guides", build_guide_embed())
 
     result = await get_scan()
     await upsert_pinned(chans["coherence-board"], "board", board_embed(result))
@@ -627,11 +697,11 @@ async def setup_cmd(ctx):
 
     lines = [
         "**Setup complete.**",
-        f"📖 {chans['how-it-works'].mention} — guide posted and pinned",
+        f"📖 {chans['coherence-guide'].mention} — guide posted and pinned",
         f"🧭 {chans['coherence-board'].mention} — live board, rewritten every {POLL_MINUTES} min",
         f"🚨 {chans['arb-alerts'].mention} — alerts above {DEFAULT_MIN_APY:g}% annualised "
         f"and ${DEFAULT_MIN_PROFIT:g} profit",
-        f"💬 {chans['discussion'].mention} — open to everyone",
+        f"💬 {chans['arb-discussion'].mention} — open to everyone",
     ]
     if made:
         lines.append(f"\nCreated: {', '.join(c.mention for c in made)}")

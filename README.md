@@ -115,6 +115,7 @@ zéro, ce qui prouve que le pipeline travaille et permet de régler les seuils.
 |---|---|
 | `/setup` | **Crée toute la structure de salons** et branche tout (admin) |
 | `/scan [limit]` | Scan immédiat, top opportunités par rendement annualisé |
+| `/preview` | Poste une alerte d'exemple (vérifie rendu et permissions) |
 | `/board` | Installe le tableau vivant, réécrit en place à chaque cycle |
 | `/watch [min_annualised] [min_profit]` | Abonne le salon aux alertes |
 | `/unwatch` | Coupe les alertes du salon |
