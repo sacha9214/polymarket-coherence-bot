@@ -711,12 +711,85 @@ async def fetch_books(session, token_ids: list[str]) -> dict[str, Book]:
 
 
 @dataclass
+class Margin:
+    """Écart à une contrainte, en cents par part.
+
+    Négatif = contrainte respectée (l'immense majorité du temps), positif = arb
+    au moins au sommet du carnet. Sert au tableau de bord : un salon qui
+    n'afficherait que les opportunités serait vide en permanence, alors que la
+    marge la plus serrée du marché, elle, bouge en continu.
+    """
+
+    cents: float  # marge au SOMMET du carnet
+    title: str
+    slug: str
+    detail: str
+    units: float = 0.0  # parts réellement exécutables à marge positive
+
+    @property
+    def url(self) -> str:
+        return f"https://polymarket.com/event/{self.slug}"
+
+
+def compute_margins(families: list[Family]) -> list[Margin]:
+    """Marge de chaque contrainte vérifiable, la plus serrée en premier.
+
+    `cents` est la marge au sommet du carnet, `units` la taille réellement
+    disponible à marge positive. Les deux sont nécessaires : un écart de 7 cents
+    adossé à 0,03 part est un mirage, et n'afficher que la marge en ferait une
+    fausse promesse permanente.
+    """
+    out: list[Margin] = []
+    for fam in families:
+        # Ne JAMAIS écarter une issue au carnet partiellement vide : la contrainte
+        # Σ P = 1 ne porte que sur l'ensemble exhaustif des issues. Filtrer donne
+        # une somme partielle qui franchit 1 sans qu'aucun arb n'existe.
+        outs = [o for o in fam.outcomes if o.book]
+
+        if fam.kind == "buckets":
+            if len(outs) < 3:
+                continue
+            n = len(outs)
+            sa = sum(o.book.best_ask for o in outs)
+            sb = sum(o.book.best_bid for o in outs)
+            u_under, _ = walk([o.book.asks for o in outs], 1.0, 0.0, _fee_rate())
+            u_over, _ = walk([o.book.no_asks() for o in outs], float(n - 1), 0.0, _fee_rate())
+            out.append(Margin(100 * (1.0 - sa), fam.title, fam.slug,
+                              f"Σ ask {sa:.4f} (needs < 1)", u_under))
+            out.append(Margin(100 * (sb - 1.0), fam.title, fam.slug,
+                              f"Σ bid {sb:.4f} (needs > 1)", u_over))
+        else:
+            for i, narrow in enumerate(outs):
+                for wide in outs[i + 1 :]:
+                    if wide.rank <= narrow.rank:
+                        continue
+                    u, _ = walk(
+                        [wide.book.asks, narrow.book.no_asks()], 1.0, 0.0, _fee_rate()
+                    )
+                    out.append(
+                        Margin(
+                            100 * (narrow.book.best_bid - wide.book.best_ask),
+                            fam.title,
+                            fam.slug,
+                            f"bid «{narrow.label}» {narrow.book.best_bid:.3f} "
+                            f"vs ask «{wide.label}» {wide.book.best_ask:.3f}",
+                            u,
+                        )
+                    )
+
+    out.sort(key=lambda m: m.cents, reverse=True)
+    return out
+
+
+@dataclass
 class ScanResult:
     opportunities: list[Opportunity]
     events_scanned: int
     families: int
     markets: int
     duration: float
+    tightest: list[Margin] = field(default_factory=list)
+    constraints: int = 0
 
 
 async def _collect(max_events: int) -> tuple[list[dict], list[Family], list[str]]:
@@ -765,12 +838,16 @@ async def scan(max_events=MAX_EVENTS) -> ScanResult:
     # Tri par APY : c'est l'ordre dans lequel on veut réellement les traiter.
     opportunities.sort(key=lambda o: o.apy, reverse=True)
 
+    margins = compute_margins(families)
+
     return ScanResult(
         opportunities=opportunities,
         events_scanned=len(events),
         families=len(families),
         markets=len(tokens),
         duration=asyncio.get_event_loop().time() - started,
+        tightest=margins[:8],
+        constraints=len(margins),
     )
 
 
@@ -792,51 +869,20 @@ async def diagnose(max_events=MAX_EVENTS, top=15):
     """
     events, families, tokens = await _collect(max_events)
 
-    margins = []
     per_kind: dict[str, int] = {}
     for fam in families:
         per_kind[fam.kind] = per_kind.get(fam.kind, 0) + 1
-        # Surtout NE PAS écarter les issues dont un côté du carnet est vide : la
-        # contrainte Σ P = 1 ne porte que sur l'ensemble EXHAUSTIF des issues.
-        # Les filtrer produit une somme partielle qui franchit 1 sans qu'aucun
-        # arb n'existe — un piège dans lequel ce diagnostic est déjà tombé.
-        # `best_bid`/`best_ask` valent 0 et 1 sur carnet vide, ce qui rend
-        # naturellement l'opération non rentable, exactement comme dans le scan.
-        outs = [o for o in fam.outcomes if o.book]
 
-        if fam.kind == "buckets":
-            if len(outs) < 3:
-                continue
-            n = len(outs)
-            margins.append((
-                100 * (1.0 - sum(o.book.best_ask for o in outs)), fam,
-                f"Σ ask = {sum(o.book.best_ask for o in outs):.4f} (cible < 1)",
-            ))
-            margins.append((
-                100 * (sum(o.book.best_bid for o in outs) - 1.0), fam,
-                f"Σ bid = {sum(o.book.best_bid for o in outs):.4f} (cible > 1)",
-            ))
-        else:
-            for i, narrow in enumerate(outs):
-                for wide in outs[i + 1 :]:
-                    if wide.rank <= narrow.rank:
-                        continue
-                    margins.append((
-                        100 * (narrow.book.best_bid - wide.book.best_ask), fam,
-                        f"bid « {narrow.label} » {narrow.book.best_bid:.3f} "
-                        f"vs ask « {wide.label} » {wide.book.best_ask:.3f}",
-                    ))
-
-    margins.sort(key=lambda m: m[0], reverse=True)
+    margins = compute_margins(families)
 
     print(f"Événements scannés   : {len(events)}")
     print(f"Marchés interrogés   : {len(tokens)}")
     print(f"Familles par type    : {per_kind}")
     print(f"Contraintes vérifiées: {len(margins)}\n")
     print(f"Les {top} marges les plus serrées (cents par part) :\n")
-    for cents, fam, detail in margins[:top]:
-        flag = "ARB" if cents > 0 else "   "
-        print(f"  {flag} {cents:+7.2f}¢  {fam.title[:44]:44s}  {detail}")
+    for m in margins[:top]:
+        flag = "ARB" if m.cents > 0 else "   "
+        print(f"  {flag} {m.cents:+7.2f}¢ x{m.units:>9,.0f}  {m.title[:38]:38s}  {m.detail}")
     print(
         f"\nSeuil d'alerte actuel : +{MIN_EDGE_CENTS:.2f}¢ par part, "
         f"ROI ≥ {MIN_ROI_PCT}%, taille ≥ {MIN_UNITS:.0f} parts."

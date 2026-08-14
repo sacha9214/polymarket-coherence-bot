@@ -47,6 +47,14 @@ REALERT_HOURS = 6
 # Ré-alerte anticipée si l'opportunité a beaucoup grossi depuis la dernière fois.
 REALERT_GROWTH = 2.0
 
+# Permissions demandées à l'invitation : voir/écrire/embeds, plus créer les salons
+# (`/setup`) et épingler (`manage_messages`). Rien de plus — le bot n'a aucune
+# raison de toucher aux membres ni aux rôles.
+INVITE_PERMS = 1024 | 2048 | 16384 | 16 | 8192
+
+DEFAULT_MIN_APY = 25.0
+DEFAULT_MIN_PROFIT = 2.0
+
 _LOCK_PATH = Path(__file__).with_name("bot.lock")
 _lock_file = None
 
@@ -89,6 +97,17 @@ db.execute(
   PRIMARY KEY(channel_id, key))"""
 )
 db.execute("""CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT)""")
+# Un seul message réécrit en place par salon : le tableau montre l'état courant
+# au lieu d'un fil qui défile. Idem pour le guide, sinon `/guide` deux fois de
+# suite laisse deux copies dans le salon.
+db.execute(
+    """CREATE TABLE IF NOT EXISTS board(
+  channel_id INTEGER PRIMARY KEY, message_id INTEGER, updated INTEGER)"""
+)
+db.execute(
+    """CREATE TABLE IF NOT EXISTS guides(
+  channel_id INTEGER PRIMARY KEY, message_id INTEGER, updated INTEGER)"""
+)
 db.commit()
 
 
@@ -178,6 +197,71 @@ def opp_embed(o: C.Opportunity) -> discord.Embed:
     return e
 
 
+def board_embed(result: C.ScanResult) -> discord.Embed:
+    """Tableau réécrit en place à chaque cycle.
+
+    Il n'affiche pas QUE les opportunités : elles sont rares, et un tableau vide
+    en permanence ne dit pas si le scanner tourne encore. On montre donc l'état de
+    cohérence du marché — les contraintes les plus serrées — avec, à chaque fois,
+    la taille réellement exécutable. Un écart de 7 cents adossé à 0 part est un
+    mirage, et l'afficher sans sa taille en ferait une promesse mensongère.
+    """
+    live = bool(result.opportunities)
+    e = discord.Embed(
+        title="🧭 Polymarket coherence — live",
+        description=(
+            f"**{len(result.opportunities)} executable** "
+            f"· {result.constraints:,} constraints checked "
+            f"· {result.markets:,} markets in {result.duration:.1f}s"
+        ),
+        color=0x2ECC71 if live else 0x34495E,
+    )
+
+    if live:
+        for o in result.opportunities[:3]:
+            icon = KIND_STYLE.get(o.kind, ("⚪",))[0]
+            e.add_field(
+                name=f"{icon} {o.title[:80]}",
+                value=(
+                    f"{o.detail[:140]}\n"
+                    f"**{C.fmt_usd(o.profit)}** locked in · {o.units:,.0f} shares · "
+                    f"{C.fmt_usd(o.capital)} capital · **{o.apy:,.0f}%** annualised "
+                    f"· {horizon_label(o.days)}\n[Open market]({o.url})"
+                ),
+                inline=False,
+            )
+
+    lines = []
+    for m in result.tightest[:6]:
+        mark = "🟢" if m.cents > 0 and m.units >= C.MIN_UNITS else "▫️"
+        size = f"×{m.units:,.0f}" if m.units >= 1 else "×0"
+        lines.append(f"{mark} `{m.cents:+5.2f}¢ {size:>8}` {m.title[:44]}")
+    if lines:
+        e.add_field(
+            name="Tightest constraints" if live else "Closest to breaking",
+            value="\n".join(lines)[:1024],
+            inline=False,
+        )
+
+    if not live:
+        e.add_field(
+            name="Nothing to trade — and that is the normal state",
+            value=(
+                "`¢` is the gap at the top of the book, `×` how many shares can "
+                "actually be filled at a positive margin. A wide gap with no size "
+                "behind it is a mirage, which is why both are always shown.\n"
+                "🟢 = real depth behind the gap, but still **below the alert "
+                "thresholds** (edge per share, profit, or annualised return).\n"
+                "▫️ = no usable size — ignore it."
+            ),
+            inline=False,
+        )
+
+    e.set_footer(text=f"Rewritten every {POLL_MINUTES} min · never uses mid prices")
+    e.timestamp = discord.utils.utcnow()
+    return e
+
+
 GUIDE = (
     "**What this channel is**\n"
     "Every alert here is a set of Polymarket positions whose combined payout is "
@@ -201,6 +285,47 @@ GUIDE = (
     "• Fees are assumed to be zero. Check the current fee schedule before sizing up.\n"
     "• Silence is the normal state. A coherent market offers nothing."
 )
+
+
+def build_guide_embed() -> discord.Embed:
+    return discord.Embed(
+        title="📖 How to read this channel", description=GUIDE, color=0x34495E
+    )
+
+
+async def upsert_pinned(channel, table: str, embed: discord.Embed) -> discord.Message:
+    """Réécrit le message épinglé du salon, ou le crée s'il n'existe pas (encore).
+
+    Sans réécriture, relancer `/board` ou `/guide` empile les copies et le salon
+    finit avec trois tableaux dont deux sont périmés.
+    """
+    row = db.execute(
+        f"SELECT message_id FROM {table} WHERE channel_id=?", (channel.id,)
+    ).fetchone()
+    if row:
+        try:
+            msg = await channel.fetch_message(row[0])
+            await msg.edit(embed=embed)
+            db.execute(
+                f"UPDATE {table} SET updated=? WHERE channel_id=?",
+                (int(time.time()), channel.id),
+            )
+            db.commit()
+            return msg
+        except discord.NotFound:
+            pass  # message supprimé à la main → on le recrée
+
+    msg = await channel.send(embed=embed)
+    try:
+        await msg.pin()
+    except discord.DiscordException:
+        pass  # pas la permission d'épingler : le message reste utile, on continue
+    db.execute(
+        f"INSERT OR REPLACE INTO {table} VALUES(?,?,?)",
+        (channel.id, msg.id, int(time.time())),
+    )
+    db.commit()
+    return msg
 
 
 # ---------------------------------------------------------------------------
@@ -234,10 +359,9 @@ def mark_alerted(channel_id: int, o: C.Opportunity):
 
 @tasks.loop(minutes=POLL_MINUTES)
 async def poll():
-    subs = db.execute(
-        "SELECT channel_id, min_apy, min_profit FROM subs"
-    ).fetchall()
-    if not subs:
+    subs = db.execute("SELECT channel_id, min_apy, min_profit FROM subs").fetchall()
+    boards = db.execute("SELECT channel_id FROM board").fetchall()
+    if not subs and not boards:
         return
 
     try:
@@ -245,6 +369,16 @@ async def poll():
     except Exception as e:  # noqa: BLE001
         print(f"[poll] scan failed: {type(e).__name__}: {e}", flush=True)
         return
+
+    # Tableaux d'abord : ils doivent rester à jour même si aucun salon n'est abonné.
+    for (channel_id,) in boards:
+        ch = bot.get_channel(channel_id)
+        if ch is None:
+            continue
+        try:
+            await upsert_pinned(ch, "board", board_embed(result))
+        except discord.DiscordException as e:
+            print(f"[poll] board update failed on {channel_id}: {e}", flush=True)
 
     for channel_id, min_apy, min_profit in subs:
         ch = bot.get_channel(channel_id)
@@ -397,12 +531,119 @@ async def status_cmd(ctx):
     guild_ids=GUILDS,
 )
 async def guide_cmd(ctx):
-    await ctx.defer()
+    await ctx.defer(ephemeral=True)
+    await upsert_pinned(ctx.channel, "guides", build_guide_embed())
     await ctx.respond(
-        embed=discord.Embed(
-            title="📖 How to read this channel", description=GUIDE, color=0x34495E
-        )
+        "📖 Guide posted and pinned. Running `/guide` again updates that same "
+        "message instead of adding another one.",
+        ephemeral=True,
     )
+
+
+@bot.slash_command(
+    name="board",
+    description="Install the live coherence board in this channel",
+    guild_ids=GUILDS,
+)
+async def board_cmd(ctx):
+    await ctx.defer(ephemeral=True)
+    result = await get_scan()
+    await upsert_pinned(ctx.channel, "board", board_embed(result))
+    await ctx.respond(
+        f"🧭 Board installed and pinned. It is **rewritten in place every "
+        f"{POLL_MINUTES} min**, so this channel always shows the current state — "
+        "no feed to scroll through.\nRun `/guide` to pin the how-to-read note too.",
+        ephemeral=True,
+    )
+
+
+@bot.slash_command(
+    name="setup",
+    description="Create the full channel structure and wire everything up",
+    guild_ids=GUILDS,
+)
+@discord.default_permissions(manage_guild=True)
+async def setup_cmd(ctx):
+    await ctx.defer(ephemeral=True)
+    g = ctx.guild
+    if g is None:
+        return await ctx.respond("Run this in a server, not in a DM.", ephemeral=True)
+
+    if not g.me.guild_permissions.manage_channels:
+        return await ctx.respond(
+            "I need the **Manage Channels** permission to build the structure.\n"
+            "Grant it to my role in Server Settings → Roles, or re-invite me with:\n"
+            f"https://discord.com/oauth2/authorize?client_id={bot.user.id}"
+            f"&permissions={INVITE_PERMS}&scope=bot%20applications.commands",
+            ephemeral=True,
+        )
+
+    # Salons en lecture seule : tout le monde lit, seul le bot écrit. Un flux
+    # d'alertes où n'importe qui peut poster devient illisible en deux jours.
+    read_only = {
+        g.default_role: discord.PermissionOverwrite(
+            send_messages=False, add_reactions=True
+        ),
+        g.me: discord.PermissionOverwrite(send_messages=True, manage_messages=True),
+    }
+
+    plan = [
+        ("how-it-works", "Read this first — what an arbitrage alert here means", True),
+        ("coherence-board", "Live state of the market, rewritten automatically", True),
+        ("arb-alerts", "Executable inconsistencies, the moment they appear", True),
+        ("discussion", "Talk about the calls here — open to everyone", False),
+    ]
+
+    cat = discord.utils.get(g.categories, name="POLYMARKET COHERENCE")
+    if cat is None:
+        cat = await g.create_category("POLYMARKET COHERENCE")
+
+    made, reused, chans = [], [], {}
+    for name, topic, locked in plan:
+        ch = discord.utils.get(g.text_channels, name=name)
+        if ch is None:
+            ch = await g.create_text_channel(
+                name, category=cat, topic=topic,
+                overwrites=read_only if locked else None,
+            )
+            made.append(ch)
+        else:
+            reused.append(ch)
+        chans[name] = ch
+
+    await upsert_pinned(chans["how-it-works"], "guides", build_guide_embed())
+
+    result = await get_scan()
+    await upsert_pinned(chans["coherence-board"], "board", board_embed(result))
+
+    db.execute(
+        "INSERT OR REPLACE INTO subs VALUES(?,?,?,?,?)",
+        (
+            chans["arb-alerts"].id, g.id,
+            DEFAULT_MIN_APY, DEFAULT_MIN_PROFIT, int(time.time()),
+        ),
+    )
+    db.commit()
+
+    lines = [
+        "**Setup complete.**",
+        f"📖 {chans['how-it-works'].mention} — guide posted and pinned",
+        f"🧭 {chans['coherence-board'].mention} — live board, rewritten every {POLL_MINUTES} min",
+        f"🚨 {chans['arb-alerts'].mention} — alerts above {DEFAULT_MIN_APY:g}% annualised "
+        f"and ${DEFAULT_MIN_PROFIT:g} profit",
+        f"💬 {chans['discussion'].mention} — open to everyone",
+    ]
+    if made:
+        lines.append(f"\nCreated: {', '.join(c.mention for c in made)}")
+    if reused:
+        lines.append(f"Reused existing: {', '.join(c.mention for c in reused)}")
+    lines.append(
+        "\nAlert channels are read-only for members (reactions still allowed). "
+        "Change the thresholds anytime with `/watch` in that channel.\n"
+        "Expect long silences: a coherent market produces nothing, and that is "
+        "the scanner working, not failing."
+    )
+    await ctx.respond("\n".join(lines), ephemeral=True)
 
 
 # ---------------------------------------------------------------------------

@@ -113,11 +113,31 @@ zéro, ce qui prouve que le pipeline travaille et permet de régler les seuils.
 
 | Commande | Effet |
 |---|---|
+| `/setup` | **Crée toute la structure de salons** et branche tout (admin) |
 | `/scan [limit]` | Scan immédiat, top opportunités par rendement annualisé |
+| `/board` | Installe le tableau vivant, réécrit en place à chaque cycle |
 | `/watch [min_annualised] [min_profit]` | Abonne le salon aux alertes |
 | `/unwatch` | Coupe les alertes du salon |
 | `/status` | Réglages, seuils et dernier scan |
 | `/guide` | Poste la note « comment lire ce salon » (à épingler) |
+
+`/setup` crée la catégorie **POLYMARKET COHERENCE** avec quatre salons —
+`how-it-works` (guide épinglé), `coherence-board` (tableau vivant), `arb-alerts`
+(le flux) et `discussion` (ouvert) — les trois premiers en lecture seule pour les
+membres. Relancer la commande réutilise les salons existants au lieu d'en créer
+des doublons.
+
+### Le tableau vivant
+
+Comme « zéro opportunité » est l'état normal, un tableau qui n'afficherait que les
+arbs serait vide en permanence et ne dirait pas si le scanner tourne encore. Il
+montre donc la **santé de cohérence du marché** : les contraintes les plus
+serrées, chacune avec son écart au sommet du carnet **et sa taille réellement
+exécutable**.
+
+Les deux sont indispensables. Exemple réel rencontré : un écart de **+7,10 ¢** sur
+un marché de température, adossé à **0,03 part** disponible sur une des jambes.
+Afficher l'écart seul en aurait fait une promesse mensongère permanente.
 
 ## Réglages
 
