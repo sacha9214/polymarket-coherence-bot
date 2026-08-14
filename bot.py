@@ -177,22 +177,53 @@ def opp_embed(o: C.Opportunity) -> discord.Embed:
         color=color,
     )
 
-    legs = "\n".join(f"`{leg}`" for leg in o.legs[:12])
-    if len(o.legs) > 12:
-        legs += f"\n`… +{len(o.legs) - 12} more legs`"
-    e.add_field(name="Trade", value=legs, inline=False)
+    # Le bloc d'ordres est l'information principale : sans prix limite ni taille,
+    # une alerte dit qu'un arb existe sans dire comment le prendre — et payer un
+    # tick de trop suffit à le faire disparaître.
+    orders = o.orders[:12]
+    lines = []
+    for i, ord_ in enumerate(orders, 1):
+        lines.append(
+            f"`{i}.` **BUY {ord_.side}** «{ord_.label[:26]}»\n"
+            f"　　 max price `{ord_.limit:.3f}` · `{ord_.shares:,.0f}` shares · "
+            f"{C.fmt_usd(ord_.cost)}"
+        )
+    if len(o.orders) > 12:
+        lines.append(f"`…` +{len(o.orders) - 12} more legs, all required")
 
-    e.add_field(name="Size", value=f"{o.units:,.0f} shares", inline=True)
-    e.add_field(name="Capital", value=C.fmt_usd(o.capital), inline=True)
-    e.add_field(name="Locked for", value=horizon_label(o.days), inline=True)
+    e.add_field(
+        name="📋 Orders to place",
+        value="\n".join(lines)[:1024],
+        inline=False,
+    )
 
-    e.add_field(name="Locked-in profit", value=C.fmt_usd(o.profit), inline=True)
-    e.add_field(name="Return", value=f"{o.roi:.2f}%", inline=True)
-    e.add_field(name="Annualised", value=f"{o.apy:,.0f}%", inline=True)
+    payout = o.capital + o.profit
+    e.add_field(
+        name="💰 What you get",
+        value=(
+            # Montants exacts, pas arrondis : « $1.2K → $1.2K » masquerait
+            # précisément le gain, qui est toute l'information de la ligne.
+            f"Pay **${o.capital:,.2f}** now → receive **${payout:,.2f}** "
+            f"at resolution, whatever happens.\n"
+            f"Locked-in profit **${o.profit:,.2f}** · {o.roi:.2f}% over "
+            f"{horizon_label(o.days)} · **{o.apy:,.0f}%** annualised"
+        ),
+        inline=False,
+    )
+
+    e.add_field(
+        name="⚠️ All legs or none",
+        value=(
+            "Never pay above the max price — one tick more and the edge is gone. "
+            "If one leg fills and another does not, unwind immediately: a single "
+            "leg is a directional bet, which is exactly what this avoids."
+        ),
+        inline=False,
+    )
 
     e.set_footer(
-        text="Sizes come from the live order book, not mid prices. "
-        "The book moves — re-check before trading."
+        text="Prices walked from the live order book, never mid. "
+        "The book moves in seconds — re-check before sending."
     )
     return e
 
@@ -274,10 +305,17 @@ GUIDE = (
     "🟣 **Price ladders** — *BTC above $60k* can never be less likely than "
     "*BTC above $70k*. When the order flips, the pair is mispriced.\n"
     "🟠 **Date ladders** — same idea across deadlines.\n\n"
-    "**How to read the numbers**\n"
-    "`Size` is what the real order book can absorb right now, walked level by "
-    "level — not the top-of-book quote. `Annualised` matters more than `Return`: "
-    "0.3% that settles tomorrow beats 5% that settles next year.\n\n"
+    "**How to act on an alert**\n"
+    "Every alert lists the exact orders to place: which side, how many shares, "
+    "and a **max price**. Place them as *limit* orders at that price — never "
+    "higher. The edge is a few cents per share, so paying one tick more can "
+    "erase it entirely.\n"
+    "Fill **every leg or none**. If one fills and another does not, unwind at "
+    "once: a single leg is a directional bet, which is the exact thing this "
+    "avoids.\n"
+    "Sizes come from walking the real order book, not the top-of-book quote. "
+    "`Annualised` matters more than `Return`: 0.3% that settles tomorrow beats "
+    "5% that settles next year.\n\n"
     "**What the bot does not tell you**\n"
     "• You must fill **every leg**. Polymarket has no all-or-nothing execution — "
     "if one leg fills and another doesn't, you are left with a directional bet.\n"

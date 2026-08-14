@@ -172,31 +172,62 @@ class Book:
         return [(1.0 - p, s) for p, s in self.bids]
 
 
+@dataclass
+class Fill:
+    """Ce qu'une jambe coûte réellement à la taille exécutable.
+
+    `worst_price` est le prix limite à poser : c'est le pire niveau consommé,
+    donc celui qui reproduit exactement l'opération calculée. Sans lui, une
+    alerte n'est pas actionnable — on sait qu'il y a un arb, mais pas à quel
+    prix on cesse de le gagner.
+    """
+
+    cost: float = 0.0
+    worst_price: float = 0.0
+
+    def avg(self, units: float) -> float:
+        return self.cost / units if units else 0.0
+
+
+@dataclass
+class WalkResult:
+    units: float
+    cost: float
+    fills: list[Fill] = field(default_factory=list)
+
+    def __iter__(self):
+        """Reste dépaquetable en (units, cost) pour tous les appels existants."""
+        return iter((self.units, self.cost))
+
+
 def walk(
     legs: list[list[tuple[float, float]]],
     payoff: float,
     min_edge: float,
     fee_rate: float,
-) -> tuple[float, float]:
+) -> WalkResult:
     """Marche les carnets en achetant 1 part de chaque jambe par unité.
 
     Le coût unitaire ne peut que se dégrader en descendant les niveaux : prendre
     glouton tant que c'est rentable donne donc l'optimum exact, pas une heuristique.
 
-    Retourne (unités exécutables, coût total frais inclus).
+    Retourne les unités exécutables, le coût total frais inclus, et le détail
+    par jambe (coût et pire prix touché) nécessaire pour dicter les ordres.
     """
+    n = len(legs)
     if not legs or any(not lv for lv in legs):
-        return 0.0, 0.0
+        return WalkResult(0.0, 0.0, [Fill() for _ in range(n)])
 
-    idx = [0] * len(legs)
+    idx = [0] * n
     rem = [lv[0][1] for lv in legs]
+    fills = [Fill() for _ in range(n)]
     units = 0.0
     cost = 0.0
 
     while True:
-        if any(idx[j] >= len(legs[j]) for j in range(len(legs))):
+        if any(idx[j] >= len(legs[j]) for j in range(n)):
             break
-        unit = sum(legs[j][idx[j]][0] for j in range(len(legs)))
+        unit = sum(legs[j][idx[j]][0] for j in range(n))
         unit *= 1.0 + fee_rate
         if unit >= payoff - min_edge:
             break
@@ -208,13 +239,16 @@ def walk(
         units += qty
         cost += qty * unit
 
-        for j in range(len(legs)):
+        for j in range(n):
+            price = legs[j][idx[j]][0]
+            fills[j].cost += qty * price * (1.0 + fee_rate)
+            fills[j].worst_price = price
             rem[j] -= qty
             if rem[j] <= 1e-9:
                 idx[j] += 1
                 rem[j] = legs[j][idx[j]][1] if idx[j] < len(legs[j]) else 0.0
 
-    return units, cost
+    return WalkResult(units, cost, fills)
 
 
 # ---------------------------------------------------------------------------
@@ -246,6 +280,21 @@ class Family:
 
 
 @dataclass
+class Order:
+    """Un ordre à passer, tel qu'on le taperait sur Polymarket."""
+
+    side: str  # "YES" ou "NO"
+    label: str
+    shares: float
+    limit: float  # prix limite : au-dessus, l'arb n'existe plus
+    avg: float
+    cost: float
+
+    def __str__(self) -> str:
+        return f"{self.side} {self.label} @ {self.limit:.3f}"
+
+
+@dataclass
 class Opportunity:
     kind: str
     title: str
@@ -256,6 +305,7 @@ class Opportunity:
     capital: float
     profit: float
     days: float = 30.0  # capital immobilisé jusqu'à résolution de la DERNIÈRE jambe
+    orders: list[Order] = field(default_factory=list)
 
     @property
     def roi(self) -> float:
@@ -524,7 +574,8 @@ def scan_buckets(fam: Family) -> list[Opportunity]:
     horizon = max(days_until(o.end_date) for o in outs)
 
     # Côté « somme sous 1 » : coût = Σ ask(YES), gain = 1 $.
-    units, cost = walk([o.book.asks for o in outs], 1.0, edge, _fee_rate())
+    w = walk([o.book.asks for o in outs], 1.0, edge, _fee_rate())
+    units, cost = w.units, w.cost
     if units >= MIN_UNITS:
         found.append(
             Opportunity(
@@ -536,6 +587,10 @@ def scan_buckets(fam: Family) -> list[Opportunity]:
                     f"acheter YES sur les {n} issues coûte moins que le dollar garanti."
                 ),
                 legs=[f"YES {o.label} @ {o.book.best_ask:.3f}" for o in outs],
+                orders=[
+                    Order("YES", o.label, units, f.worst_price, f.avg(units), f.cost)
+                    for o, f in zip(outs, w.fills)
+                ],
                 units=units,
                 capital=cost,
                 profit=units * 1.0 - cost,
@@ -544,7 +599,8 @@ def scan_buckets(fam: Family) -> list[Opportunity]:
         )
 
     # Côté « somme sur 1 » : coût = Σ ask(NO), gain = (N-1) $.
-    units, cost = walk([o.book.no_asks() for o in outs], float(n - 1), edge, _fee_rate())
+    w = walk([o.book.no_asks() for o in outs], float(n - 1), edge, _fee_rate())
+    units, cost = w.units, w.cost
     if units >= MIN_UNITS:
         found.append(
             Opportunity(
@@ -556,6 +612,10 @@ def scan_buckets(fam: Family) -> list[Opportunity]:
                     f"acheter NO sur les {n} issues : une seule perdra."
                 ),
                 legs=[f"NO {o.label} @ {1 - o.book.best_bid:.3f}" for o in outs],
+                orders=[
+                    Order("NO", o.label, units, f.worst_price, f.avg(units), f.cost)
+                    for o, f in zip(outs, w.fills)
+                ],
                 units=units,
                 capital=cost,
                 profit=units * (n - 1) - cost,
@@ -590,9 +650,8 @@ def scan_ladder(fam: Family) -> list[Opportunity]:
                 continue
 
             # Une jambe YES sur le large, une jambe NO sur l'étroit.
-            units, cost = walk(
-                [wide_o.book.asks, narrow_o.book.no_asks()], 1.0, edge, fee
-            )
+            w = walk([wide_o.book.asks, narrow_o.book.no_asks()], 1.0, edge, fee)
+            units, cost = w.units, w.cost
             if units < MIN_UNITS:
                 continue
 
@@ -609,6 +668,12 @@ def scan_ladder(fam: Family) -> list[Opportunity]:
                     legs=[
                         f"YES {wide_o.label} @ {wide_o.book.best_ask:.3f}",
                         f"NO {narrow_o.label} @ {1 - narrow_o.book.best_bid:.3f}",
+                    ],
+                    orders=[
+                        Order("YES", wide_o.label, units, w.fills[0].worst_price,
+                              w.fills[0].avg(units), w.fills[0].cost),
+                        Order("NO", narrow_o.label, units, w.fills[1].worst_price,
+                              w.fills[1].avg(units), w.fills[1].cost),
                     ],
                     units=units,
                     capital=cost,

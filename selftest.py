@@ -109,6 +109,48 @@ def test_echelle_detecte_inversion():
 
 
 @case
+def test_ordres_donnent_taille_et_prix_limite():
+    """Une alerte doit dicter chaque ordre : côté, taille, prix à ne pas dépasser."""
+    fam = C.Family(
+        "e", "Test ladder", "slug", "strikes",
+        [
+            out("étroit", 1, 0.80, bids=[(0.80, 100)], asks=[(0.82, 100)]),
+            out("moyen", 2, 0.70, bids=[(0.68, 100)], asks=[(0.70, 100)]),
+            out("large", 3, 0.60, bids=[(0.58, 100)], asks=[(0.60, 100)]),
+        ],
+    )
+    o = max(C.scan_ladder(fam), key=lambda x: x.profit)
+    assert len(o.orders) == 2, o.orders
+    achat, vente = o.orders
+    assert (achat.side, achat.label) == ("YES", "large")
+    assert (vente.side, vente.label) == ("NO", "étroit")
+    assert abs(achat.limit - 0.60) < 1e-9, achat.limit
+    assert abs(vente.limit - 0.20) < 1e-9, vente.limit  # NO = 1 - bid 0.80
+    assert abs(achat.shares - 100) < 1e-9
+    # Le total des jambes doit refaire le capital annoncé.
+    assert abs(sum(x.cost for x in o.orders) - o.capital) < 1e-6
+
+
+@case
+def test_prix_limite_suit_la_profondeur():
+    """En descendant les niveaux, la limite doit refléter le PIRE prix touché,
+    sinon l'ordre dicté ne remplirait pas la taille annoncée."""
+    fam = C.Family(
+        "e", "T", "s", "strikes",
+        [
+            out("étroit", 1, 0.80, bids=[(0.80, 200)], asks=[(0.85, 200)]),
+            out("m", 2, 0.70, bids=[(0.60, 200)], asks=[(0.65, 200)]),
+            out("large", 3, 0.60, bids=[(0.50, 200)], asks=[(0.55, 50), (0.58, 150)]),
+        ],
+    )
+    o = max(C.scan_ladder(fam), key=lambda x: x.profit)
+    achat = o.orders[0]
+    assert achat.shares > 50, "doit consommer les deux niveaux"
+    assert abs(achat.limit - 0.58) < 1e-9, achat.limit
+    assert 0.55 < achat.avg < 0.58, achat.avg
+
+
+@case
 def test_echelle_coherente_ne_dit_rien():
     fam = C.Family(
         "e", "Test ladder", "slug", "strikes",
