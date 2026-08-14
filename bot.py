@@ -180,20 +180,33 @@ def opp_embed(o: C.Opportunity) -> discord.Embed:
     # Le bloc d'ordres est l'information principale : sans prix limite ni taille,
     # une alerte dit qu'un arb existe sans dire comment le prendre — et payer un
     # tick de trop suffit à le faire disparaître.
-    orders = o.orders[:12]
-    lines = []
-    for i, ord_ in enumerate(orders, 1):
-        lines.append(
+    # Toutes les jambes vivent dans le MÊME événement Polymarket : un seul lien
+    # suffit. On le construit D'ABORD et on lui réserve sa place : ajouté en
+    # dernier puis tronqué à 1024, un slug un peu long le coupait en deux et
+    # l'alerte perdait le seul moyen d'aller passer les ordres.
+    link = f"\n🔗 **[Open the event on Polymarket]({o.url})** — all legs are here"
+    budget = 1024 - len(link)
+
+    lines, shown = [], 0
+    for i, ord_ in enumerate(o.orders, 1):
+        row = (
             f"`{i}.` **BUY {ord_.side}** «{ord_.label[:26]}»\n"
             f"　　 max price `{ord_.limit:.3f}` · `{ord_.shares:,.0f}` shares · "
             f"{C.fmt_usd(ord_.cost)}"
         )
-    if len(o.orders) > 12:
-        lines.append(f"`…` +{len(o.orders) - 12} more legs, all required")
+        rest = len(o.orders) - i
+        tail = f"\n`…` +{rest} more legs, all required" if rest else ""
+        if sum(len(x) + 1 for x in lines) + len(row) + len(tail) > budget:
+            break
+        lines.append(row)
+        shown = i
+
+    if shown < len(o.orders):
+        lines.append(f"`…` +{len(o.orders) - shown} more legs, all required")
 
     e.add_field(
         name="📋 Orders to place",
-        value="\n".join(lines)[:1024],
+        value=("\n".join(lines) + link)[:1024],
         inline=False,
     )
 
