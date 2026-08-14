@@ -322,6 +322,9 @@ async def scan_cmd(ctx, limit: int = 5):
     guild_ids=GUILDS,
 )
 async def watch_cmd(ctx, min_annualised: float = 25.0, min_profit: float = 2.0):
+    # La fenêtre d'interaction Discord est de 3 s et la boucle de scan peut
+    # occuper l'event loop : sans defer, l'interaction meurt en 404 (10062).
+    await ctx.defer(ephemeral=True)
     db.execute(
         "INSERT OR REPLACE INTO subs VALUES(?,?,?,?,?)",
         (
@@ -345,6 +348,7 @@ async def watch_cmd(ctx, min_annualised: float = 25.0, min_profit: float = 2.0):
     name="unwatch", description="Stop alerts in this channel", guild_ids=GUILDS
 )
 async def unwatch_cmd(ctx):
+    await ctx.defer(ephemeral=True)
     db.execute("DELETE FROM subs WHERE channel_id=?", (ctx.channel.id,))
     db.commit()
     await ctx.respond("🔕 Stopped watching this channel.", ephemeral=True)
@@ -354,6 +358,7 @@ async def unwatch_cmd(ctx):
     name="status", description="Scanner settings and last run", guild_ids=GUILDS
 )
 async def status_cmd(ctx):
+    await ctx.defer(ephemeral=True)
     last = int(meta_get("last_scan", 0) or 0)
     row = db.execute(
         "SELECT min_apy, min_profit FROM subs WHERE channel_id=?", (ctx.channel.id,)
@@ -392,6 +397,7 @@ async def status_cmd(ctx):
     guild_ids=GUILDS,
 )
 async def guide_cmd(ctx):
+    await ctx.defer()
     await ctx.respond(
         embed=discord.Embed(
             title="📖 How to read this channel", description=GUIDE, color=0x34495E
@@ -406,9 +412,14 @@ async def guide_cmd(ctx):
 async def on_ready():
     print(f"Connected as {bot.user}", flush=True)
     try:
+        # Purger les globales AVANT de synchroniser par serveur : sinon les deux
+        # jeux cohabitent et Discord affiche chaque commande EN DOUBLE dans le
+        # menu. Sans effet sur une app neuve, indispensable après coup.
+        await bot.http.bulk_upsert_global_commands(bot.application_id, [])
         # Sync par serveur : effet immédiat, au lieu d'environ une heure en global.
-        for guild in bot.guilds:
-            await bot.sync_commands(guild_ids=[guild.id])
+        await bot.sync_commands(
+            guild_ids=[g.id for g in bot.guilds], force=True
+        )
         print(f"Commands synced on {len(bot.guilds)} guild(s)", flush=True)
     except discord.DiscordException as e:
         print(f"Command sync failed: {e}", flush=True)
