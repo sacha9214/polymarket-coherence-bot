@@ -544,6 +544,8 @@ async def before_poll():
     description="Scan Polymarket right now for logical inconsistencies",
     guild_ids=GUILDS,
 )
+@discord.option("limit", int, description="How many to show (1-8)",
+                min_value=1, max_value=8, default=5, required=False)
 async def scan_cmd(ctx, limit: int = 5):
     await ctx.defer()
     result = await get_scan()
@@ -577,6 +579,10 @@ async def scan_cmd(ctx, limit: int = 5):
     description="Send inconsistency alerts to this channel",
     guild_ids=GUILDS,
 )
+@discord.option("min_annualised", float, description="Minimum annualised return (%)",
+                min_value=0, default=25.0, required=False)
+@discord.option("min_profit", float, description="Minimum locked-in profit ($)",
+                min_value=0, default=2.0, required=False)
 async def watch_cmd(ctx, min_annualised: float = 25.0, min_profit: float = 2.0):
     # La fenêtre d'interaction Discord est de 3 s et la boucle de scan peut
     # occuper l'event loop : sans defer, l'interaction meurt en 404 (10062).
