@@ -109,6 +109,36 @@ db.execute(
     """CREATE TABLE IF NOT EXISTS guides(
   channel_id INTEGER PRIMARY KEY, message_id INTEGER, updated INTEGER)"""
 )
+# Journal des alertes : table qu'on n'écrase JAMAIS, contrairement à `seen` qui
+# n'est qu'un antidoublon. Sans ce journal, impossible de savoir après coup ce
+# que le bot a réellement annoncé — le bot overlap en a fait la démonstration :
+# sa table `seen` est une photo réécrite à chaque cycle, donc son historique
+# d'alertes est définitivement perdu.
+#
+# verdict : NULL tant que non jugé · "win"  = arithmétique tenue, l'arb payait
+#           "void" = un marché annulé a cassé la garantie
+#           "partial" = tous les marchés du groupe ne sont pas encore résolus
+db.execute(
+    """CREATE TABLE IF NOT EXISTS journal(
+  id       INTEGER PRIMARY KEY AUTOINCREMENT,
+  key      TEXT,
+  kind     TEXT,
+  slug     TEXT,
+  title    TEXT,
+  profit   REAL,
+  capital  REAL,
+  units    REAL,
+  apy      REAL,
+  days     REAL,
+  ts       INTEGER,
+  verdict  TEXT,
+  scored   INTEGER)"""
+)
+db.execute("CREATE INDEX IF NOT EXISTS idx_journal_verdict ON journal(verdict, ts)")
+db.execute(
+    """CREATE TABLE IF NOT EXISTS trackboard(
+  channel_id INTEGER PRIMARY KEY, message_id INTEGER, updated INTEGER)"""
+)
 # Salons retenus par IDENTIFIANT, pas par nom : un identifiant survit aux
 # renommages, un nom non. Sans ça, ajouter un emoji au nom d'un salon fait que
 # `/setup` ne le reconnaît plus et en recrée un doublon à côté.
@@ -283,6 +313,145 @@ def opp_embed(o: C.Opportunity) -> discord.Embed:
         text="Prices walked from the live order book, never mid. "
         "The book moves in seconds — re-check before sending."
     )
+    return e
+
+
+# Tranches de gain. La médiane des alertes est de 5 $ : sans découpage, le
+# tableau serait écrasé par quelques arbs géants qui font 78 % du total mais
+# exigent un capital hors de portée.
+TRACK_BUCKETS = [
+    ("under $5", 0, 5),
+    ("$5–20", 5, 20),
+    ("$20–100", 20, 100),
+    ("$100–1k", 100, 1000),
+    ("over $1k", 1000, float("inf")),
+]
+
+
+async def score_journal(limit: int = 60) -> int:
+    """Juge les alertes en attente dont l'événement s'est dénoué.
+
+    On ne rejuge jamais une alerte déjà tranchée en "win" ou "void" : ces
+    verdicts sont définitifs. Seuls "partial", "open" et les non jugées sont
+    repris à chaque passage.
+    """
+    pending = db.execute(
+        "SELECT DISTINCT slug FROM journal "
+        "WHERE slug<>'' AND (verdict IS NULL OR verdict IN ('open','partial')) "
+        "ORDER BY ts DESC LIMIT ?",
+        (limit,),
+    ).fetchall()
+    if not pending:
+        return 0
+
+    verdicts = await C.score_events([r[0] for r in pending])
+    now = int(time.time())
+    n = 0
+    for slug, verdict in verdicts.items():
+        cur = db.execute(
+            "UPDATE journal SET verdict=?, scored=? "
+            "WHERE slug=? AND (verdict IS NULL OR verdict IN ('open','partial'))",
+            (verdict, now, slug),
+        )
+        n += cur.rowcount
+    db.commit()
+    return n
+
+
+def track_record() -> dict:
+    """Bilan par tranche de gain : alertes, jugeables, réussies, taux, cumul."""
+    rows = db.execute(
+        "SELECT profit, verdict FROM journal WHERE profit IS NOT NULL"
+    ).fetchall()
+    out = {"buckets": [], "total": dict(alerts=0, judged=0, wins=0, pending=0, gain=0.0)}
+    for label, lo, hi in TRACK_BUCKETS:
+        b = [(p, v) for p, v in rows if lo <= (p or 0) < hi]
+        if not b:
+            continue
+        wins = sum(1 for _, v in b if v == "win")
+        voids = sum(1 for _, v in b if v == "void")
+        judged = wins + voids
+        gain = sum(p for p, _ in b)
+        won_gain = sum(p for p, v in b if v == "win")
+        out["buckets"].append(dict(
+            label=label, alerts=len(b), judged=judged, wins=wins, voids=voids,
+            pending=len(b) - judged, gain=gain, won_gain=won_gain,
+        ))
+        t = out["total"]
+        t["alerts"] += len(b); t["judged"] += judged; t["wins"] += wins
+        t["pending"] += len(b) - judged; t["gain"] += gain
+    return out
+
+
+def track_embed() -> discord.Embed:
+    """Bilan public du bot : ce qu'il a annoncé, et ce que ça a donné.
+
+    Un bot qui affiche ses alertes sans jamais dire si elles tenaient demande
+    qu'on lui fasse confiance sur parole. Ce tableau répond à la seule question
+    qui compte pour un visiteur : est-ce que ça marche vraiment ?
+    """
+    tr = track_record()
+    t = tr["total"]
+    rate = (100 * t["wins"] / t["judged"]) if t["judged"] else 0.0
+
+    first = db.execute("SELECT MIN(ts) FROM journal").fetchone()[0]
+    days = ((time.time() - first) / 86400) if first else 0.0
+
+    e = discord.Embed(
+        title="📒 Track record — every alert, scored",
+        description=(
+            f"**{t['alerts']:,}** alerts logged over **{days:.1f} days**. "
+            f"**{t['judged']:,}** have fully resolved.\n"
+            f"A coherence arb pays **by construction** — the only way it breaks "
+            f"is a market being **voided**, paying neither side. That is what "
+            f"this scores."
+        ),
+        color=0x2ECC71 if rate >= 99 and t["judged"] else 0x34495E,
+    )
+
+    if t["judged"]:
+        e.add_field(
+            name="Verdict",
+            value=f"**{t['wins']:,} / {t['judged']:,}** held up — **{rate:.1f}%**",
+            inline=False,
+        )
+
+    if not tr["buckets"]:
+        e.add_field(
+            name="No alerts logged yet",
+            value="The journal starts filling on the next alert. Nothing is lost "
+                  "from here on — every alert is written down and scored when its "
+                  "markets settle.",
+            inline=False,
+        )
+        e.set_footer(text=f"Rewritten every {POLL_MINUTES} min")
+        return e
+
+    lines = [f"`{'bucket':<10}{'alerts':>7}{'judged':>8}{'held':>6}{'rate':>7}`"]
+    for b in tr["buckets"]:
+        r = f"{100*b['wins']/b['judged']:.0f}%" if b["judged"] else "—"
+        lines.append(
+            f"`{b['label']:<10}{b['alerts']:>7}{b['judged']:>8}{b['wins']:>6}{r:>7}`"
+        )
+    e.add_field(name="By size", value="\n".join(lines)[:1024], inline=False)
+
+    gl = [f"`{b['label']:<10}` {C.fmt_usd(b['won_gain']):>9} settled "
+          f"· {C.fmt_usd(b['gain'])} incl. open" for b in tr["buckets"]]
+    e.add_field(name="Locked-in gain (theoretical)", value="\n".join(gl)[:1024], inline=False)
+
+    e.add_field(
+        name="Read this before the numbers",
+        value=(
+            "Nothing here was traded — these are the gains the alerts described, "
+            "not money made. A handful of huge multi-leg arbs dominate the totals "
+            "and need capital most people don't have; the **median alert is worth "
+            "a few dollars**. The rate above says the maths held, not that the bot "
+            "predicted anything."
+        ),
+        inline=False,
+    )
+    e.set_footer(text=f"Rewritten every {POLL_MINUTES} min · pending alerts are re-checked as markets settle")
+    e.timestamp = discord.utils.utcnow()
     return e
 
 
@@ -476,6 +645,15 @@ def mark_alerted(channel_id: int, o: C.Opportunity):
         "INSERT OR REPLACE INTO seen VALUES(?,?,?,?)",
         (channel_id, o.key, int(time.time()), o.profit),
     )
+    # Journal permanent, en plus de l'antidoublon. On enregistre au moment de
+    # l'alerte : les prix et la taille exécutable ne sont plus reconstituables
+    # après coup, et c'est précisément ce qu'on voudra juger plus tard.
+    db.execute(
+        "INSERT INTO journal(key,kind,slug,title,profit,capital,units,apy,days,ts) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (o.key, o.kind, o.slug, o.title, o.profit, o.capital, o.units,
+         o.apy, o.days, int(time.time())),
+    )
     db.commit()
 
 
@@ -491,6 +669,24 @@ async def poll():
     except Exception as e:  # noqa: BLE001
         print(f"[poll] scan failed: {type(e).__name__}: {e}", flush=True)
         return
+
+    # Juger les alertes en attente dont les marchés se sont dénoués. Isolé dans
+    # son propre try : une panne du scoreur ne doit pas empêcher les alertes.
+    try:
+        n = await score_journal()
+        if n:
+            print(f"[journal] {n} alerte(s) jugée(s)", flush=True)
+    except Exception as e:  # noqa: BLE001
+        print(f"[journal] scoring failed: {type(e).__name__}: {e}", flush=True)
+
+    for (channel_id,) in db.execute("SELECT channel_id FROM trackboard").fetchall():
+        ch = bot.get_channel(channel_id)
+        if ch is None:
+            continue
+        try:
+            await upsert_pinned(ch, "trackboard", track_embed())
+        except discord.DiscordException as e:
+            print(f"[poll] trackboard failed on {channel_id}: {e}", flush=True)
 
     # Tableaux d'abord : ils doivent rester à jour même si aucun salon n'est abonné.
     for (channel_id,) in boards:
@@ -732,6 +928,21 @@ async def preview_cmd(ctx):
         "🧪 Sample alert posted — this is exactly how a real one will look.\n"
         "Delete it whenever you like; it is not stored and never repeats.",
         ephemeral=True,
+    )
+
+
+@bot.slash_command(
+    name="track-board",
+    description="Install the live track record board in this channel",
+    guild_ids=GUILDS,
+)
+async def track_board_cmd(ctx):
+    await ctx.defer(ephemeral=True)
+    await install_pinned(
+        ctx, "trackboard", track_embed(),
+        f"📒 Track record installed and pinned, rewritten every {POLL_MINUTES} min.\n"
+        "Every alert is logged and scored once its markets settle — including the "
+        "ones that fail.",
     )
 
 

@@ -996,5 +996,62 @@ async def _main():
         print(f"   {o.url}")
 
 
+
+
+# ---------------------------------------------------------------------------
+# Jugement a posteriori des alertes
+# ---------------------------------------------------------------------------
+
+
+async def score_events(slugs: list[str]) -> dict[str, str]:
+    """Verdict par événement : l'arbitrage annoncé aurait-il payé ?
+
+    Un arbitrage de cohérence paie PAR CONSTRUCTION — sauf si un marché du
+    groupe est **annulé** (`outcomePrices == ["0","0"]`), auquel cas il ne paie
+    ni YES ni NO et la somme garantie s'effondre. C'est le seul mode d'échec, et
+    donc la seule chose à vérifier.
+
+    Contrôle volontairement strict : on exige **exactement un gagnant** dans le
+    groupe. Se contenter de « l'événement est clos » laisserait passer des
+    groupes à zéro ou deux gagnants, qui casseraient l'arithmétique sans que
+    rien ne le signale.
+
+    Retourne "win" | "void" | "partial" | "open" par slug.
+    """
+    out: dict[str, str] = {}
+    sem = asyncio.Semaphore(6)
+
+    async def one(session, slug):
+        async with sem:
+            data = await _get(session, f"{GAMMA}/events", {"slug": slug})
+        if not data:
+            return
+        markets = (data[0].get("markets") or []) if isinstance(data, list) else []
+        if not markets:
+            return
+        closed = [m for m in markets if m.get("closed")]
+        if not closed:
+            out[slug] = "open"
+            return
+        if len(closed) < len(markets):
+            out[slug] = "partial"
+            return
+
+        winners = voided = 0
+        for m in closed:
+            prices = _jloads(m.get("outcomePrices"), [])
+            if len(prices) != 2:
+                continue
+            if prices == ["0", "0"]:
+                voided += 1
+            elif prices[0] == "1":
+                winners += 1
+        out[slug] = "win" if (winners == 1 and voided == 0) else "void"
+
+    async with aiohttp.ClientSession() as session:
+        await asyncio.gather(*(one(session, s) for s in slugs))
+    return out
+
+
 if __name__ == "__main__":
     asyncio.run(_main())
