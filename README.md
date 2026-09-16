@@ -179,3 +179,7 @@ Un scan complet couvre ~1 900 marchés en **~2 secondes**.
 - **Le silence est l'état normal.** Un marché cohérent n'offre rien. Le bot ne sert
   que les minutes où il ne l'est pas — si tu veux des alertes en continu, tu as
   construit le mauvais outil.
+
+## Licence
+
+[MIT](LICENSE)
