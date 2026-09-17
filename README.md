@@ -1,81 +1,81 @@
 # Coherence Bot — Polymarket
 
-Détecte les **incohérences logiques** entre marchés Polymarket liés, et les
-signale sur Discord.
+Detects **logical inconsistencies** between related Polymarket markets and
+reports them on Discord.
 
-Le bot ne prédit rien. Il ne dit jamais « achète » ni « vends ». Il cherche des
-prix qui **se contredisent entre eux**, et pour chaque contradiction il construit
-un portefeuille dont le gain est positif quel que soit le résultat de l'événement.
-Une alerte n'est donc pas une opinion : c'est un fait arithmétique.
+The bot predicts nothing. It never says "buy" or "sell". It looks for prices
+that **contradict each other**, and for each contradiction it builds a portfolio
+whose payoff is positive whatever the outcome of the event. An alert is therefore
+not an opinion: it is an arithmetic fact.
 
 ---
 
-## Les trois contradictions traquées
+## The three contradictions it hunts
 
-### 🟢🔵 Buckets — la somme doit valoir 1
+### 🟢🔵 Buckets — the sum must equal 1
 
-Sur les marchés groupés (`negRisk`), les issues sont mutuellement exclusives et
-couvrent tous les cas : *Bitcoin price on August 14?* → `<56k`, `56-58k`, `58-60k`…
-Exactement une paiera 1 $. Leur somme doit donc valoir 1.
+On grouped markets (`negRisk`), outcomes are mutually exclusive and cover every
+case: *Bitcoin price on August 14?* → `<56k`, `56-58k`, `58-60k`…
+Exactly one will pay $1, so their prices must sum to 1.
 
-- **Σ ask < 1** → acheter YES sur toutes les issues coûte moins que le dollar garanti.
-- **Σ bid > 1** → acheter NO sur toutes : une seule perdra, les autres paient.
+- **Σ ask < 1** → buying YES on every outcome costs less than the guaranteed dollar.
+- **Σ bid > 1** → buy NO on every outcome: only one will lose, the others pay.
 
-Chaque issue a son propre carnet d'ordres, et rien ne force mécaniquement la somme :
-c'est là que l'écart naît.
+Each outcome has its own order book and nothing mechanically enforces the sum:
+that is where the gap appears.
 
-### 🟣 Échelles de strikes — la monotonie
+### 🟣 Strike ladders — monotonicity
 
-*Bitcoin above $60,000* ne peut pas être **moins** probable que *Bitcoin above
-$70,000* : le second implique le premier. Quand l'ordre s'inverse, la paire est
-arbitrable.
+*Bitcoin above $60,000* cannot be **less** likely than *Bitcoin above
+$70,000*: the second implies the first. When the order flips, the pair can be
+arbitraged.
 
-Fonctionne aussi sur les échelles inversées (*dip to $60,000*), dont la monotonie
-est l'opposée.
+Also works on inverted ladders (*dip to $60,000*), whose monotonicity runs the
+other way.
 
-### 🟠 Échelles de dates — même principe
+### 🟠 Date ladders — same principle
 
-*Bitcoin hits $150k by December 31* ≥ *by June 30*. Toute inversion est exploitable.
+*Bitcoin hits $150k by December 31* ≥ *by June 30*. Any inversion can be exploited.
 
-### Le portefeuille, dans les trois cas
+### The portfolio, in all three cases
 
-Si A implique B, alors P(B) ≥ P(A). On achète YES sur B (le large) et NO sur A
-(l'étroit) :
+If A implies B, then P(B) ≥ P(A). Buy YES on B (the broad one) and NO on A
+(the narrow one):
 
-| Résultat | YES B | NO A | Total |
+| Outcome | YES B | NO A | Total |
 |---|---|---|---|
-| A vrai (donc B vrai) | 1 | 0 | **1** |
-| B vrai seul | 1 | 1 | **2** |
-| ni l'un ni l'autre | 0 | 1 | **1** |
+| A true (so B true) | 1 | 0 | **1** |
+| B true only | 1 | 1 | **2** |
+| neither | 0 | 1 | **1** |
 
-Gain plancher 1 $ pour un coût de `ask(B) + 1 − bid(A)`. L'opération est donc
-rentable exactement quand **`ask(B) < bid(A)`**, et la marge par part vaut
-`bid(A) − ask(B)` — sans qu'aucune probabilité n'intervienne.
+A guaranteed payoff of at least $1 for a cost of `ask(B) + 1 − bid(A)`. The trade is
+profitable exactly when **`ask(B) < bid(A)`**, and the margin per share is
+`bid(A) − ask(B)` — without any probability involved.
 
 ---
 
-## Ce qui fait la différence avec un jouet
+## What separates it from a toy
 
-**Les prix affichés ne sont jamais utilisés.** `outcomePrices` est un mid ; une
-inversion sur les mid disparaît dès qu'on regarde le spread. Tout est calculé sur
-le carnet réel, en descendant les niveaux un par un, ce qui donne la taille
-réellement exécutable et le gain net à cette taille.
+**Displayed prices are never used.** `outcomePrices` is a mid; an inversion on
+mids disappears as soon as you look at the spread. Everything is computed on the
+real order book, walking the levels one by one, which gives the size that can
+actually be executed and the net profit at that size.
 
-**L'orientation des échelles est déduite des données, pas devinée.** Une liste de
-mots-clés ne survit pas à la diversité des formulations : *« BTC above $60k »* et
-*« ceasefire continues through Dec 31 »* sont toutes deux des échelles, de
-monotonie opposée. Un signe inversé ne produit pas une erreur visible — il produit
-une échelle entière de fausses opportunités très convaincantes (c'est arrivé
-pendant le développement). Le moteur lit donc le sens dans les prix eux-mêmes
-(tau de Kendall), et **se tait** quand le signal est ambigu.
+**Ladder orientation is inferred from the data, not guessed.** A keyword list
+does not survive the variety of market wording: *"BTC above $60k"* and
+*"ceasefire continues through Dec 31"* are both ladders, with opposite
+monotonicity. A flipped sign doesn't produce a visible error — it produces a whole
+ladder of very convincing fake opportunities (this happened during development).
+The engine therefore reads the direction from the prices themselves (Kendall's
+tau), and **stays silent** when the signal is ambiguous.
 
-**Le classement se fait à l'APY, pas au ROI.** 0,3 % qui se dénoue demain vaut
-bien mieux que 5 % qui se dénoue dans un an, puisque le capital se recycle. Trier
-au ROI brut classe à l'envers.
+**Ranking is by APY, not ROI.** 0.3% that settles tomorrow is worth far more than
+5% that settles in a year, since the capital gets recycled. Sorting by raw ROI
+ranks things backwards.
 
-**Les sommes partielles sont interdites.** Écarter une issue dont un côté du
-carnet est vide fait franchir 1 à la somme sans qu'aucun arb n'existe. La
-contrainte ne porte que sur l'ensemble exhaustif.
+**Partial sums are forbidden.** Dropping an outcome whose book is empty on one
+side pushes the sum past 1 without any arb existing. The constraint only holds
+over the exhaustive set.
 
 ---
 
@@ -86,100 +86,101 @@ cd polymarket-coherence-bot
 python3 -m venv venv && ./venv/bin/pip install -r requirements.txt
 ```
 
-Mets le jeton de ton bot Discord dans `token.txt` (une ligne), ou dans
-`DISCORD_BOT_TOKEN`. Optionnel : `DISCORD_GUILD_ID` pour un enregistrement
-instantané des commandes au lieu d'environ une heure.
+Put your Discord bot token in `token.txt` (one line), or in
+`DISCORD_BOT_TOKEN`. Optional: `DISCORD_GUILD_ID` to register commands
+instantly instead of after about an hour.
 
 ```bash
 ./start_mac_linux.sh
 ```
 
-## Sans Discord
+## Without Discord
 
-Le moteur est autonome — c'est ce qui permet de vérifier les chiffres sans
-jamais lancer le bot :
+The engine is standalone — that's what makes it possible to check the numbers
+without ever starting the bot:
 
 ```bash
-./venv/bin/python coherence.py             # scan complet
-./venv/bin/python coherence.py --diagnose  # marges les plus serrées, même celles qui tiennent
-./venv/bin/python selftest.py              # 18 tests sur carnets synthétiques
+./venv/bin/python coherence.py             # full scan
+./venv/bin/python coherence.py --diagnose  # tightest margins, even those that hold
+./venv/bin/python selftest.py              # 20 tests on synthetic order books
 ```
 
-`--diagnose` est là pour une raison précise : un scan qui ne trouve rien est
-indiscernable d'un moteur cassé. Le diagnostic montre les contraintes qui frôlent
-zéro, ce qui prouve que le pipeline travaille et permet de régler les seuils.
+`--diagnose` exists for a specific reason: a scan that finds nothing is
+indistinguishable from a broken engine. The diagnosis shows the constraints
+closest to zero, which proves the pipeline is working and helps tune the thresholds.
 
-## Commandes Discord
+## Discord commands
 
-| Commande | Effet |
+| Command | Effect |
 |---|---|
-| `/setup` | **Crée toute la structure de salons** et branche tout (admin) |
-| `/scan [limit]` | Scan immédiat, top opportunités par rendement annualisé |
-| `/preview` | Poste une alerte d'exemple (vérifie rendu et permissions) |
-| `/board` | Installe le tableau vivant, réécrit en place à chaque cycle |
-| `/watch [min_annualised] [min_profit]` | Abonne le salon aux alertes |
-| `/unwatch` | Coupe les alertes du salon |
-| `/status` | Réglages, seuils et dernier scan |
-| `/guide` | Poste la note « comment lire ce salon » (à épingler) |
+| `/setup` | **Creates the full channel structure** and wires everything up (admin) |
+| `/scan [limit]` | Immediate scan, top opportunities by annualized return |
+| `/preview` | Posts a sample alert (checks formatting and permissions) |
+| `/board` | Installs the live board, rewritten in place every cycle |
+| `/track-board` | Installs the live track record board |
+| `/watch [min_annualised] [min_profit]` | Subscribes the channel to alerts |
+| `/unwatch` | Stops alerts in the channel |
+| `/status` | Settings, thresholds and last scan |
+| `/guide` | Posts the "how to read this channel" note (pin it) |
 
-`/setup` crée la catégorie **POLYMARKET COHERENCE** avec quatre salons —
-`coherence-guide` (guide épinglé), `coherence-board` (tableau vivant),
-`arb-alerts` (le flux) et `arb-discussion` (ouvert) — les trois premiers en
-lecture seule pour les membres. La commande est **idempotente** : la relancer
-réutilise les salons existants et recâble tout, elle ne crée pas de doublons.
+`/setup` creates the **POLYMARKET COHERENCE** category with four channels —
+`coherence-guide` (pinned guide), `coherence-board` (live board),
+`arb-alerts` (the feed) and `arb-discussion` (open) — the first three read-only
+for members. The command is **idempotent**: running it again reuses the existing
+channels and rewires everything, without creating duplicates.
 
-Les noms sont préfixés à dessein. Ce bot cohabite avec le bot overlap, dont le
-`/setup` crée déjà `how-it-works` et `discussion` : avec des noms génériques,
-chaque bot croirait reconnaître les salons de l'autre et irait écrire dedans. La
-recherche de salons existants est en plus limitée à notre propre catégorie, pas
-au serveur entier.
+Channel names are prefixed on purpose. This bot shares a server with the overlap
+bot, whose `/setup` already creates `how-it-works` and `discussion`: with generic
+names, each bot would think it recognized the other's channels and start writing
+in them. The search for existing channels is also limited to this bot's own
+category, not the whole server.
 
-### Le tableau vivant
+### The live board
 
-Comme « zéro opportunité » est l'état normal, un tableau qui n'afficherait que les
-arbs serait vide en permanence et ne dirait pas si le scanner tourne encore. Il
-montre donc la **santé de cohérence du marché** : les contraintes les plus
-serrées, chacune avec son écart au sommet du carnet **et sa taille réellement
-exécutable**.
+Since "zero opportunities" is the normal state, a board that only listed arbs
+would be permanently empty and wouldn't tell you whether the scanner is still
+running. It shows the **market's coherence health** instead: the tightest
+constraints, each with its gap at the top of the book **and the size that can
+actually be executed**.
 
-Les deux sont indispensables. Exemple réel rencontré : un écart de **+7,10 ¢** sur
-un marché de température, adossé à **0,03 part** disponible sur une des jambes.
-Afficher l'écart seul en aurait fait une promesse mensongère permanente.
+Both are essential. A real example: a **+7.10¢** gap on a temperature market,
+backed by **0.03 shares** available on one of the legs. Showing the gap alone
+would have been a permanent false promise.
 
-## Réglages
+## Settings
 
-Tout est en haut de `coherence.py` :
+Everything is at the top of `coherence.py`:
 
-| Réglage | Défaut | Rôle |
+| Setting | Default | Role |
 |---|---|---|
-| `MAX_EVENTS` | 400 | Événements scannés (volume 24h décroissant) |
-| `MIN_EDGE_CENTS` | 1.0 | Marge minimale par part, après frais |
-| `MIN_APY_PCT` | 15.0 | Le vrai filtre de décision |
-| `MIN_PROFIT_USD` | 1.0 | Sous ce seuil, le gas mange l'opération |
-| `MAX_LEGS` | 15 | Au-delà, le capital immobilisé est absurde |
-| `FEE_BPS` | 0.0 | **À vérifier** avant de trader en réel |
+| `MAX_EVENTS` | 400 | Events scanned (by 24h volume, descending) |
+| `MIN_EDGE_CENTS` | 1.0 | Minimum margin per share, after fees |
+| `MIN_APY_PCT` | 15.0 | The real decision filter |
+| `MIN_PROFIT_USD` | 1.0 | Below this, gas eats the trade |
+| `MAX_LEGS` | 15 | Beyond this, the capital tied up is absurd |
+| `FEE_BPS` | 0.0 | **Check this** before trading for real |
 
-Un scan complet couvre ~1 900 marchés en **~2 secondes**.
+A full scan covers ~1,900 markets in **~2 seconds**.
 
 ---
 
-## Limites — à lire avant de trader
+## Limitations — read before trading
 
-- **Rien n'est exécuté.** Le bot détecte et signale, il ne passe aucun ordre.
-- **Pas d'exécution atomique.** Polymarket n'offre pas le tout-ou-rien
-  multi-jambes. Si une jambe passe et l'autre non, tu te retrouves avec un pari
-  directionnel — exactement ce que l'outil sert à éviter. C'est le vrai risque.
-- **Le carnet bouge en secondes.** Chaque chiffre vaut pour l'instant où il a été
-  envoyé.
-- **Les frais sont supposés nuls** (`FEE_BPS = 0`). Historiquement vrai sur
-  Polymarket, mais des frais ont été introduits sur certains marchés : vérifie la
-  grille en vigueur avant de dimensionner.
-- **Le mécanisme `negRisk`** referme automatiquement une partie des écarts sur les
-  marchés groupés. Les opportunités « buckets » y sont donc plus rares qu'ailleurs.
-- **Le silence est l'état normal.** Un marché cohérent n'offre rien. Le bot ne sert
-  que les minutes où il ne l'est pas — si tu veux des alertes en continu, tu as
-  construit le mauvais outil.
+- **Nothing is executed.** The bot detects and reports; it never places an order.
+- **No atomic execution.** Polymarket has no all-or-nothing multi-leg orders.
+  If one leg fills and the other doesn't, you are left with a directional bet —
+  exactly what this tool is meant to avoid. That is the real risk.
+- **The book moves within seconds.** Every number is valid for the moment it was
+  sent.
+- **Fees are assumed to be zero** (`FEE_BPS = 0`). Historically true on
+  Polymarket, but fees have been introduced on some markets: check the current
+  schedule before sizing a trade.
+- **The `negRisk` mechanism** automatically closes part of the gaps on grouped
+  markets, so "bucket" opportunities are rarer there than elsewhere.
+- **Silence is the normal state.** A coherent market offers nothing. The bot only
+  matters in the minutes when it isn't — if you want a constant stream of alerts,
+  you built the wrong tool.
 
-## Licence
+## License
 
 [MIT](LICENSE)
